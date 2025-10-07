@@ -71,16 +71,26 @@ class AudioBridge:
             await self.send({'message_type': 'set_task', 'data': self.settings})
 
             self._running = True
-            self._palabra_receive_task = asyncio.create_task(self._receive_from_palabra())
-            self._twilio_receive_task = asyncio.create_task(self._receive_from_twilio())
-            self._sender_task = asyncio.create_task(self._sender())
+            self._palabra_receive_task = asyncio.create_task(self._receive_from_palabra(), name="palabra_receive_task")
+            self._twilio_receive_task = asyncio.create_task(self._receive_from_twilio(), name="twilio_receive_task")
+            self._sender_task = asyncio.create_task(self._sender(), name="sender_task")
 
-            await asyncio.gather(
-                self._palabra_receive_task,
-                self._twilio_receive_task,
-                self._sender_task,
-                return_exceptions=True,
+            _, pending = await asyncio.wait(
+                [
+                    self._palabra_receive_task,
+                    self._twilio_receive_task,
+                    self._sender_task,
+                ],
+                return_when=asyncio.FIRST_COMPLETED,
             )
+
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         except Exception as e:
             logger.warning('WebSocket run error: %s', e)
         finally:
@@ -194,8 +204,8 @@ class AudioBridge:
                 logger.info('WebSocket connection closed')
                 break
             except asyncio.TimeoutError:
-                logger.info('WebSocket receive timeout')
-                continue
+                logger.info('Palabra WebSocket receive timeout')
+                break
             except Exception as e:
                 logger.error(f'WebSocket error: {e}')
                 break
@@ -283,7 +293,14 @@ class AudioBridge:
                 except asyncio.CancelledError:
                     pass
 
-            # Close WebSocket connections
+            if self._sender_task and not self._sender_task.done():
+                self._sender_task.cancel()
+                try:
+                    await self._sender_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Close Palabra WebSocket connection
             if self.palabra_ws:
                 await self.send(
                     {
@@ -296,6 +313,21 @@ class AudioBridge:
                     await self.palabra_ws.close()
                 except Exception as e:
                     logger.error('Error closing Palabra WebSocket: %s', e)
+
+            # Close Twilio WebSocket connections (source_ws and target_ws)
+            if self.source_ws and self.source_ws.client_state != WebSocketState.DISCONNECTED:
+                try:
+                    await self.source_ws.close()
+                    logger.info('Source WebSocket (Twilio) closed for role %s', self.role)
+                except Exception as e:
+                    logger.error('Error closing source WebSocket: %s', e)
+
+            if self.target_ws and self.target_ws.client_state != WebSocketState.DISCONNECTED:
+                try:
+                    await self.target_ws.close()
+                    logger.info('Target WebSocket (Twilio) closed for role %s', self.role)
+                except Exception as e:
+                    logger.error('Error closing target WebSocket: %s', e)
 
             # Delete Palabra session
             await self._delete_palabra_session()
